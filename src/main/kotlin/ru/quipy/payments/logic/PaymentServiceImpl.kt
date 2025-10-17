@@ -9,6 +9,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import okhttp3.internal.ignoreIoExceptions
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -40,9 +41,9 @@ class PaymentSystemImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
-        private const val BUFFER_CAPACITY = 3000
-        private const val BATCH_SIZE = 100
-        private const val FLUSH_INTERVAL_MS = 250L
+        private const val BUFFER_CAPACITY = 5000
+        private const val BATCH_SIZE = 11
+        private const val FLUSH_INTERVAL_MS = 100L
     }
 
     private val paymentChannel = Channel<PaymentRequest>(BUFFER_CAPACITY)
