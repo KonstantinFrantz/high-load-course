@@ -33,9 +33,9 @@ class PaymentSystemImpl(
                 batch.add(paymentChannel.receive())
 
                 val timeout = System.currentTimeMillis() + FLUSH_INTERVAL_MS
-                while (System.currentTimeMillis() < timeout) {
-                    if (batch.size < BATCH_SIZE) {
-                        paymentChannel.tryReceive().getOrNull()?.let { batch.add(it) }
+                while (batch.size < BATCH_SIZE && System.currentTimeMillis() < timeout) {
+                    paymentChannel.tryReceive().getOrNull()?.let {
+                        batch.add(it)
                     }
                 }
 
