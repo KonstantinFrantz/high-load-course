@@ -2,36 +2,11 @@ package ru.quipy.payments.logic
 
 import jakarta.annotation.PostConstruct
 import jakarta.annotation.PreDestroy
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import okhttp3.internal.ignoreIoExceptions
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.context.annotation.Bean
-import org.springframework.context.annotation.Configuration
-import org.springframework.core.task.TaskExecutor
-import org.springframework.scheduling.annotation.Async
-import org.springframework.scheduling.annotation.AsyncConfigurer
-import org.springframework.scheduling.annotation.EnableAsync
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
 
 
 @Service
