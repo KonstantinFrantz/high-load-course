@@ -18,8 +18,8 @@ class PaymentSystemImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
         private const val BUFFER_CAPACITY = 5000
-        private const val BATCH_SIZE = 11
-        private const val FLUSH_INTERVAL_MS = 100L
+        private const val BATCH_SIZE = 3
+        private const val FLUSH_INTERVAL_MS = 200L
     }
 
     private val paymentChannel = Channel<PaymentRequest>(BUFFER_CAPACITY)
