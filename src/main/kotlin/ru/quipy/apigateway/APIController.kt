@@ -31,19 +31,6 @@ class APIController {
     @Autowired
     private lateinit var paymentMetrics: PaymentMetrics
 
-    private val  paymentRateLimiter = CompositeRateLimiter(
-        rl1 = TokenBucketRateLimiter(
-            rate = 15,
-            bucketMaxCapacity = 30,
-            window = 1,
-            timeUnit = TimeUnit.SECONDS
-        ),
-        rl2 = SlidingWindowRateLimiter(
-            rate = 15,
-            window = Duration.ofSeconds(1)
-        )
-    )
-
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
         return User(UUID.randomUUID(), req.name)
@@ -80,30 +67,17 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<Any> {
-        if (!paymentRateLimiter.tick()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).body(
-                mapOf(
-                    "error" to "Too many requests",
-                    "message" to "Rate limit exceeded. Please try again later."
-                )
-            )
-        }
-
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto{
+        val paymentId = UUID.randomUUID()
         paymentMetrics.incomingRequests()
+        val order = orderRepository.findById(orderId)?.let {
+            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+            it
+        } ?: throw IllegalArgumentException("No such order $orderId")
 
-        try {
-            val paymentId = UUID.randomUUID()
-            val order = orderRepository.findById(orderId)?.let {
-                orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-                it
-            } ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Order not found")
 
-            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
-        } catch (e: Exception) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Payment processing failed")
-        }
+        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        return PaymentSubmissionDto(createdAt, paymentId)
     }
 
     class PaymentSubmissionDto(

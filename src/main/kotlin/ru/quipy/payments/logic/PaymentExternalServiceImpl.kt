@@ -51,7 +51,6 @@ class PaymentExternalSystemAdapterImpl(
         rateLimiter.tickBlocking()
 
         val currentTime = now()
-/*
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
             paymentMetrics.failedIncomingRequests()
@@ -67,7 +66,6 @@ class PaymentExternalSystemAdapterImpl(
             ongoingWindow.release()
             return
         }
-*/
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentMetrics.outgoingRequests()
