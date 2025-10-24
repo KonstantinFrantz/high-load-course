@@ -7,6 +7,8 @@ import kotlinx.coroutines.channels.Channel
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
 
@@ -24,6 +26,7 @@ class PaymentSystemImpl(
 
     private val paymentChannel = Channel<PaymentRequest>(BUFFER_CAPACITY)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val executor = Executors.newScheduledThreadPool(4)
 
     @PostConstruct
     fun init() {
@@ -48,11 +51,17 @@ class PaymentSystemImpl(
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+            for (account in paymentAccounts) {
+                account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            }
+        /*
         val request = PaymentRequest(paymentId, amount, paymentStartedAt, deadline)
 
-        if (!paymentChannel.trySend(request).isSuccess) {
-            logger.warn("Payment channel is full, rejecting payment: $paymentId")
-        }
+                if (!paymentChannel.trySend(request).isSuccess) {
+                    logger.warn("Payment channel is full, rejecting payment: $paymentId")
+                }
+                *
+         */
     }
 
     private suspend fun processBatch(batch: List<PaymentRequest>) {
