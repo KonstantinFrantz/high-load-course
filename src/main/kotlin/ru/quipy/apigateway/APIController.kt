@@ -70,11 +70,8 @@ class APIController {
         } ?: throw IllegalArgumentException("No such order $orderId")
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            ?: return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "100")
-                .build()
 
-        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        return ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
     }
 
     class PaymentSubmissionDto(
