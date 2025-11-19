@@ -41,7 +41,7 @@ class PaymentExternalSystemAdapterImpl(
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val client = OkHttpClient.Builder()
-        .readTimeout(15000, TimeUnit.MILLISECONDS)
+        .readTimeout(1500, TimeUnit.MILLISECONDS)
         .build()
 
     private val maxRetries = 5
@@ -55,9 +55,23 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
         rateLimiter.tickBlocking()
-        //ongoingWindow.acquire()
+        ongoingWindow.acquire()
 
         val currentTime = now()
+        if (currentTime > deadline) {
+            logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
+            paymentMetrics.failedIncomingRequests()
+            paymentESService.update(paymentId) {
+                it.logSubmission(
+                    success = false,
+                    transactionId,
+                    currentTime,
+                    Duration.ofMillis(currentTime - paymentStartedAt),
+                )
+            }
+            ongoingWindow.release()
+            return
+        }
 
         paymentMetrics.outgoingRequests()
         paymentESService.update(paymentId) {
@@ -162,7 +176,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-     //   ongoingWindow.release()
+       ongoingWindow.release()
     }
 
     override fun price() = properties.price

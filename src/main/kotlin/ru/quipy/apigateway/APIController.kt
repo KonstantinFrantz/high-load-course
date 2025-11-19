@@ -67,19 +67,17 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto>  {
         val paymentId = UUID.randomUUID()
         paymentMetrics.incomingRequests()
+        val order = orderRepository.findById(orderId)?.let {
+            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+            it
+        } ?: throw IllegalArgumentException("No such order $orderId")
 
-        val future = executor.submit<ResponseEntity<PaymentSubmissionDto>> {
-            val order = orderRepository.findById(orderId)?.let {
-                orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-                it
-            } ?: throw IllegalArgumentException("No such order $orderId")
+        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+            ?: return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "100")
+                .build()
 
-            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-
-            ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
-        }
-
-        return future.get()
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 
     class PaymentSubmissionDto(
