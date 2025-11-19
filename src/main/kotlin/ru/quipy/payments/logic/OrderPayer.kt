@@ -31,7 +31,7 @@ class OrderPayer {
 
     private val processPaymentExecutor = ThreadPoolExecutor(
         50,
-        50,
+        100,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(8_000),
@@ -39,7 +39,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    var rateLimiter = LeakingBucketRateLimiter(120, Duration.ofMillis(1000), 10000)
+    var rateLimiter = LeakingBucketRateLimiter(120, Duration.ofMillis(500), 10000)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()

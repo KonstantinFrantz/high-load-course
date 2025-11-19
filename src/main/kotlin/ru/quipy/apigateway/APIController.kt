@@ -10,6 +10,7 @@ import ru.quipy.config.PaymentMetrics
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import java.util.concurrent.Executors
 
 @RestController
 class APIController {
@@ -24,6 +25,8 @@ class APIController {
 
     @Autowired
     private lateinit var paymentMetrics: PaymentMetrics
+
+    private val executor = Executors.newFixedThreadPool(50)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -64,14 +67,19 @@ class APIController {
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto>  {
         val paymentId = UUID.randomUUID()
         paymentMetrics.incomingRequests()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val future = executor.submit<ResponseEntity<PaymentSubmissionDto>> {
+            val order = orderRepository.findById(orderId)?.let {
+                orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+                it
+            } ?: throw IllegalArgumentException("No such order $orderId")
 
-        return ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
+            val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+
+            ResponseEntity.ok(createdAt?.let { PaymentSubmissionDto(it, paymentId) })
+        }
+
+        return future.get()
     }
 
     class PaymentSubmissionDto(
