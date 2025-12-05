@@ -94,10 +94,15 @@ class PaymentExternalSystemAdapterImpl(
                         "?serviceName=$serviceName&token=$token&accountName=$accountName" +
                         "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
             )
+
+            val nowTime = now()
+            val timeoutMillis = (deadline - nowTime).coerceAtLeast(1)
             return HttpRequest.newBuilder()
                 .uri(uri)
                 .timeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
                 .POST(HttpRequest.BodyPublishers.noBody())
+                .header("deadline", deadline.toString())
+                .header("timeout", timeoutMillis.toString())
                 .build()
         }
 
