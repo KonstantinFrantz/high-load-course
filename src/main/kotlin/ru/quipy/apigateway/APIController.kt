@@ -10,7 +10,6 @@ import ru.quipy.config.PaymentMetrics
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
-import java.util.concurrent.Executors
 
 @RestController
 class APIController {
@@ -25,8 +24,6 @@ class APIController {
 
     @Autowired
     private lateinit var paymentMetrics: PaymentMetrics
-
-    private val executor = Executors.newFixedThreadPool(50)
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -64,20 +61,35 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto>  {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long
+    ): ResponseEntity<PaymentSubmissionDto> {
+
         val paymentId = UUID.randomUUID()
         paymentMetrics.incomingRequests()
+
         val order = orderRepository.findById(orderId)?.let {
+            // перевели заказ в состояние "оплата идёт"
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
+        // processPayment уже сам:
+        // - проверяет rateLimiter
+        // - кладёт задачу в свой ThreadPoolExecutor
+        // - возвращает createdAt или null, но НЕ ждёт внешку
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-            ?: return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "100")
+            ?: return ResponseEntity
+                .status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", "1")
                 .build()
 
-        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        // здесь мы только говорим клиенту:
+        // "платёж принят в обработку", а не "платёж прошёл"
+        return ResponseEntity
+            .status(HttpStatus.ACCEPTED)
+            .body(PaymentSubmissionDto(createdAt, paymentId))
     }
 
     class PaymentSubmissionDto(
