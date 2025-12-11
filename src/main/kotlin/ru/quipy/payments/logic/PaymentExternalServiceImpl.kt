@@ -42,7 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    private val httpExecutor = Executors.newFixedThreadPool(150)
+    private val httpExecutor = Executors.newFixedThreadPool(110)
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
