@@ -39,8 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
- //   private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-   // private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val httpExecutor = Executors.newFixedThreadPool(150)
 
@@ -58,8 +58,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-     //   rateLimiter.tickBlocking()
-    //    ongoingWindow.acquire()
+        rateLimiter.tickBlocking()
+        ongoingWindow.acquire()
 
         val currentTime = now()
         if (currentTime > deadline) {
@@ -73,7 +73,7 @@ class PaymentExternalSystemAdapterImpl(
                     Duration.ofMillis(currentTime - paymentStartedAt),
                 )
             }
-         //  ongoingWindow.release()
+           ongoingWindow.release()
             return
         }
 
@@ -85,7 +85,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         fun complete() {
-          //  ongoingWindow.release()
+            ongoingWindow.release()
         }
 
         fun buildRequest(): HttpRequest {
@@ -99,6 +99,8 @@ class PaymentExternalSystemAdapterImpl(
                 .uri(uri)
                 .timeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
                 .POST(HttpRequest.BodyPublishers.noBody())
+                .header("deadline", deadline.toString())
+                .header("timeout", timeoutMillis.toString())
                 .build()
         }
 
