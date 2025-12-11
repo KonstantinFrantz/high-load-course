@@ -39,10 +39,10 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests)
+ //   private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+   // private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    private val httpExecutor = Executors.newFixedThreadPool(300)
+    private val httpExecutor = Executors.newFixedThreadPool(120)
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
@@ -50,7 +50,7 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val maxRetries = 5
+    private val maxRetries = 0
     private val baseBackoff = Duration.ofMillis(150)
     private val maxBackoff = Duration.ofSeconds(5)
 
@@ -58,8 +58,8 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-        rateLimiter.tickBlocking()
-        ongoingWindow.acquire()
+     //   rateLimiter.tickBlocking()
+    //    ongoingWindow.acquire()
 
         val currentTime = now()
         if (currentTime > deadline) {
@@ -73,7 +73,7 @@ class PaymentExternalSystemAdapterImpl(
                     Duration.ofMillis(currentTime - paymentStartedAt),
                 )
             }
-            ongoingWindow.release()
+         //  ongoingWindow.release()
             return
         }
 
@@ -85,14 +85,12 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         fun complete() {
-            ongoingWindow.release()
+          //  ongoingWindow.release()
         }
 
         fun buildRequest(): HttpRequest {
             val uri = URI.create(
-                "http://$paymentProviderHostPort/external/process" +
-                        "?serviceName=$serviceName&token=$token&accountName=$accountName" +
-                        "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
+                "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
             )
 
             val nowTime = now()
@@ -101,8 +99,6 @@ class PaymentExternalSystemAdapterImpl(
                 .uri(uri)
                 .timeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
                 .POST(HttpRequest.BodyPublishers.noBody())
-                .header("deadline", deadline.toString())
-                .header("timeout", timeoutMillis.toString())
                 .build()
         }
 

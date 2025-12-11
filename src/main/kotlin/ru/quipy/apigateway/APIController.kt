@@ -74,19 +74,12 @@ class APIController {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
-
-        // processPayment уже сам:
-        // - проверяет rateLimiter
-        // - кладёт задачу в свой ThreadPoolExecutor
-        // - возвращает createdAt или null, но НЕ ждёт внешку
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             ?: return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
                 .build()
 
-        // здесь мы только говорим клиенту:
-        // "платёж принят в обработку", а не "платёж прошёл"
         return ResponseEntity
             .status(HttpStatus.ACCEPTED)
             .body(PaymentSubmissionDto(createdAt, paymentId))
