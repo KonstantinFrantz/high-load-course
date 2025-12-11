@@ -50,7 +50,7 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val maxRetries = 0
+    private val maxRetries = 3
     private val baseBackoff = Duration.ofMillis(150)
     private val maxBackoff = Duration.ofSeconds(5)
 
