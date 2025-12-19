@@ -18,7 +18,6 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import kotlin.math.min
 import kotlin.random.Random
 
 class PaymentExternalSystemAdapterImpl(
@@ -43,6 +42,7 @@ class PaymentExternalSystemAdapterImpl(
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val httpExecutor = Executors.newFixedThreadPool(110)
+    private val dbExecutor = Executors.newFixedThreadPool(64)
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
@@ -65,21 +65,25 @@ class PaymentExternalSystemAdapterImpl(
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
             paymentMetrics.failedIncomingRequests()
-            paymentESService.update(paymentId) {
-                it.logSubmission(
-                    success = false,
-                    transactionId,
-                    currentTime,
-                    Duration.ofMillis(currentTime - paymentStartedAt),
-                )
+            dbExecutor.execute {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(
+                        success = false,
+                        transactionId,
+                        currentTime,
+                        Duration.ofMillis(currentTime - paymentStartedAt),
+                    )
+                }
             }
-           ongoingWindow.release()
+            ongoingWindow.release()
             return
         }
 
         paymentMetrics.outgoingRequests()
-        paymentESService.update(paymentId) {
-            it.logSubmission(true,  transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        dbExecutor.execute {
+            paymentESService.update(paymentId) {
+                it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
@@ -114,8 +118,10 @@ class PaymentExternalSystemAdapterImpl(
             if (nowTime > deadline) {
                 logger.error("[$accountName] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
                 paymentMetrics.failedOutgoingRequests()
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+                dbExecutor.execute {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+                    }
                 }
                 complete()
                 return
@@ -141,18 +147,9 @@ class PaymentExternalSystemAdapterImpl(
                             scheduleRetry(attempt + 1) { attemptRequest(attempt + 1) }
                         } else {
                             paymentMetrics.failedOutgoingRequests()
-                            when (e) {
-                                is SocketTimeoutException -> {
-                                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                                    paymentESService.update(paymentId) {
-                                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                                    }
-                                }
-                                else -> {
-                                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                                    paymentESService.update(paymentId) {
-                                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                                    }
+                            dbExecutor.execute {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = e.message)
                                 }
                             }
                             complete()
@@ -164,11 +161,6 @@ class PaymentExternalSystemAdapterImpl(
                         val bodyObj = try {
                             mapper.readValue(response.body(), ExternalSysResponse::class.java)
                         } catch (e: Exception) {
-                            logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                        "result code: $status, reason: ${response.body()}",
-                                e
-                            )
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                         }
 
@@ -176,23 +168,16 @@ class PaymentExternalSystemAdapterImpl(
                             paymentMetrics.failedOutgoingRequests()
                         }
 
-                        logger.warn(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                    "succeeded: ${bodyObj.result}, message: ${bodyObj.message}"
-                        )
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(bodyObj.result, now(), transactionId, reason = bodyObj.message)
+                        dbExecutor.execute {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(bodyObj.result, now(), transactionId, reason = bodyObj.message)
+                            }
                         }
 
                         if (bodyObj.result) {
                             complete()
                         } else if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
                             paymentMetrics.incrementExternalRetry()
-                            logger.warn(
-                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, " +
-                                        "retry attempt: ${attempt + 1}"
-                            )
                             scheduleRetry(attempt + 1) { attemptRequest(attempt + 1) }
                         } else {
                             complete()
