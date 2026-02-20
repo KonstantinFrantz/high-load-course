@@ -45,7 +45,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    private val httpExecutor = Executors.newFixedThreadPool(110)
+    private val httpExecutor = Executors.newFixedThreadPool(600)
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
@@ -58,21 +58,21 @@ class PaymentExternalSystemAdapterImpl(
         128,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(100_000),
         Executors.defaultThreadFactory(),
         CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(30))
     )
 
     private val maxRetries = 3
-    private val baseBackoff = Duration.ofMillis(150)
-    private val maxBackoff = Duration.ofSeconds(5)
+    private val baseBackoff = Duration.ofMillis(10)
+    private val maxBackoff = Duration.ofMillis(20)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-        rateLimiter.tickBlocking()
-        ongoingWindow.acquire()
+            // rateLimiter.tickBlocking()
+            //   ongoingWindow.acquire()
 
         val currentTime = now()
         if (currentTime > deadline) {
@@ -89,7 +89,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
             }
-            ongoingWindow.release()
+          //  ongoingWindow.release()
             return
         }
 
@@ -104,7 +104,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         fun complete() {
-            ongoingWindow.release()
+           //ongoingWindow.release()
         }
 
         fun buildRequest(): HttpRequest {
