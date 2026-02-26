@@ -77,7 +77,7 @@ class APIController {
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             ?: return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
+                .header("Retry-After", "30")
                 .build()
 
         return ResponseEntity

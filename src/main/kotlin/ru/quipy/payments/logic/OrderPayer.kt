@@ -29,35 +29,52 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    // Увеличиваем пул потоков: при 4000 rps очередь 80k задач начнёт
+    // накапливаться если потоков слишком мало. 40 потоков дадут запас.
+    // CallerBlockingRejectedExecutionHandler гарантирует backpressure
+    // вместо тихого дропа задач при переполнении очереди.
     private val processPaymentExecutor = ThreadPoolExecutor(
-        110,
-        110,
+        40,
+        40,
         5L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue<Runnable>(8_000),
+        LinkedBlockingQueue<Runnable>(80_000),
         NamedThreadFactory("pse"),
         CallerBlockingRejectedExecutionHandler()
     )
 
-    var rateLimiter = LeakingBucketRateLimiter(1250, Duration.ofMillis(1000), 15000)
+    // Лимит чуть ниже максимума (4500 из 5000) чтобы оставить буфер.
+    // ВАЖНО: LeakingBucketRateLimiter.tick() при переполнении возвращает false
+    // и молча дропает задачу — это неприемлемо. Если у тебя есть tickBlocking()
+    // в реализации — используй его. Если нет, нужно либо дождаться слота,
+    // либо явно фейлить с логом, а не тихо терять запросы.
+    // Здесь используем tick с явным логированием дропа.
+    var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 4500)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
-        return createdAt.takeIf {
-            rateLimiter.tick {
-                processPaymentExecutor.submit {
-                    val createdEvent = paymentESService.create {
-                        it.create(
-                            paymentId,
-                            orderId,
-                            amount
-                        )
-                    }
-                    logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
 
-                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        val accepted = rateLimiter.tick {
+            processPaymentExecutor.submit {
+                val createdEvent = paymentESService.create {
+                    it.create(
+                        paymentId,
+                        orderId,
+                        amount
+                    )
                 }
+                logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
+
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             }
         }
+
+        if (!accepted) {
+            // Явный лог вместо тихого дропа — так хотя бы видно в метриках/логах
+            // что мы теряем запросы и нужно поднять лимит или масштабировать сервис.
+            logger.warn("[$orderId] Payment $paymentId DROPPED by rate limiter at $createdAt")
+        }
+
+        return createdAt.takeIf { accepted }
     }
 }

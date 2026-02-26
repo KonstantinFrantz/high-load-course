@@ -21,7 +21,6 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
-import kotlin.math.min
 import kotlin.random.Random
 
 class PaymentExternalSystemAdapterImpl(
@@ -42,41 +41,55 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    private val httpExecutor = Executors.newFixedThreadPool(110)
+    private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
+    private val httpExecutor = ThreadPoolExecutor(
+        httpThreadPoolSize,
+        httpThreadPoolSize,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(parallelRequests * 2),
+        Executors.defaultThreadFactory(),
+        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
+    )
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
+        .connectTimeout(Duration.ofMillis(1000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
+    // 80 потоков под DB — считается как: 4000 rps * 2 ops * 5ms латентность = 40,
+    // берём x2 запас = 80. Очередь большая чтобы абсорбировать пики
+    // и не доходить до CallerBlocking который заблокирует httpExecutor.
     private val dbExecutor = ThreadPoolExecutor(
-        64,
-        128,
+        80,
+        80,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(200_000), // очень большая очередь
         Executors.defaultThreadFactory(),
-        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(30))
+        ThreadPoolExecutor.CallerRunsPolicy() // крайний случай — выполнит в вызывающем потоке, но не заблокирует
     )
 
     private val maxRetries = 3
-    private val baseBackoff = Duration.ofMillis(150)
-    private val maxBackoff = Duration.ofSeconds(5)
+    private val baseBackoff = Duration.ofMillis(100)
+    private val maxBackoff = Duration.ofSeconds(1)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
+
         rateLimiter.tickBlocking()
         ongoingWindow.acquire()
 
         val currentTime = now()
         if (currentTime > deadline) {
-            logger.error("[$accountName] Payment $paymentId deadline exceeded. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
+            logger.error("[$accountName] Payment $paymentId deadline exceeded before submission. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
             paymentMetrics.failedIncomingRequests()
 
             dbExecutor.submit {
@@ -89,6 +102,7 @@ class PaymentExternalSystemAdapterImpl(
                     )
                 }
             }
+
             ongoingWindow.release()
             return
         }
@@ -113,13 +127,13 @@ class PaymentExternalSystemAdapterImpl(
             )
 
             val nowTime = now()
-            val timeoutMillis = (deadline - nowTime).coerceAtLeast(1)
+            val remainingMillis = (deadline - nowTime).coerceIn(200L, 30_000L)
             return HttpRequest.newBuilder()
                 .uri(uri)
-                .timeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() * 2))
+                .timeout(Duration.ofMillis(remainingMillis))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .header("deadline", deadline.toString())
-                .header("timeout", timeoutMillis.toString())
+                .header("timeout", remainingMillis.toString())
                 .build()
         }
 
@@ -139,6 +153,7 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
                     }
                 }
+
                 complete()
                 return
             }
@@ -171,6 +186,7 @@ class PaymentExternalSystemAdapterImpl(
                                     it.logProcessing(false, now(), transactionId, reason = reason)
                                 }
                             }
+
                             complete()
                         }
                     } else {
