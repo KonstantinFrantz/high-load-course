@@ -10,7 +10,14 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - ${POSTGRES_CONTAINER_EXPOSED_PORT}:${POSTGRES_CONTAINER_INTERNAL_PORT}
-    command: postgres -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all -c max_connections=200
+    command: postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c max_connections=200
+      -c synchronous_commit=off
+      -c wal_writer_delay=200ms
+      -c commit_delay=10000
+      -c commit_siblings=10
     restart: unless-stopped
     networks:
       - external_network

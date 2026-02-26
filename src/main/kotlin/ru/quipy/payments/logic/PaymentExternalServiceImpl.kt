@@ -66,11 +66,11 @@ class PaymentExternalSystemAdapterImpl(
     // берём x2 запас = 80. Очередь большая чтобы абсорбировать пики
     // и не доходить до CallerBlocking который заблокирует httpExecutor.
     private val dbExecutor = ThreadPoolExecutor(
-        80,
-        80,
+        32,
+        32,
         60L,
-        TimeUnit.SECONDS,
-        LinkedBlockingQueue(200_000), // очень большая очередь
+        TimeUnit.MILLISECONDS,
+        LinkedBlockingQueue(400_000), // очень большая очередь
         Executors.defaultThreadFactory(),
         ThreadPoolExecutor.CallerRunsPolicy() // крайний случай — выполнит в вызывающем потоке, но не заблокирует
     )
