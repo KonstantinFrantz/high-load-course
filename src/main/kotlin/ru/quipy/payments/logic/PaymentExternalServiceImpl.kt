@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.OngoingWindow
@@ -28,7 +30,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-    private val paymentMetrics: PaymentMetrics
+    private val paymentMetrics: PaymentMetrics,
+    private val dbScope: CoroutineScope
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -42,10 +45,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(3000, Duration.ofMillis(500L))
+    private val rateLimiter = SlidingWindowRateLimiter(4000, Duration.ofMillis(1000L))
     private val ongoingWindow = OngoingWindow(2000)
 
-    private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
     private val httpExecutor = ThreadPoolExecutor(
         64,
         64,
@@ -62,19 +64,6 @@ class PaymentExternalSystemAdapterImpl(
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    // 80 потоков под DB — считается как: 4000 rps * 2 ops * 5ms латентность = 40,
-    // берём x2 запас = 80. Очередь большая чтобы абсорбировать пики
-    // и не доходить до CallerBlocking который заблокирует httpExecutor.
-    private val dbExecutor = ThreadPoolExecutor(
-        16,
-        16,
-        60L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(100_000), // очень большая очередь
-        Executors.defaultThreadFactory(),
-        ThreadPoolExecutor.CallerRunsPolicy() // крайний случай — выполнит в вызывающем потоке, но не заблокирует
-    )
-
     private val maxRetries = 3
     private val baseBackoff = Duration.ofMillis(100)
     private val maxBackoff = Duration.ofSeconds(1)
@@ -84,36 +73,42 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-      //  rateLimiter.tickBlocking()
+        rateLimiter.tickBlocking()
         ongoingWindow.acquire()
-        //logger.warn("${dbExecutor.activeCount}, ${dbExecutor.activeCount}, ${dbExecutor.completedTaskCount}, ${dbExecutor.queue.size}")
         val currentTime = now()
+
+            /*
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded before submission. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
-            paymentMetrics.failedIncomingRequests()
 
-            dbExecutor.submit {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(
-                        success = false,
-                        transactionId,
-                        currentTime,
-                        Duration.ofMillis(currentTime - paymentStartedAt),
-                    )
-                }
+        dbScope.launch {
+            paymentESService.update(paymentId) {
+                it.logSubmission(
+                    success = false,
+                    transactionId,
+                    currentTime,
+                    Duration.ofMillis(currentTime - paymentStartedAt),
+                )
             }
-
-            ongoingWindow.release()
-            return
         }
 
-        paymentMetrics.outgoingRequests()
 
-        dbExecutor.submit {
+
+        ongoingWindow.release()
+        return
+    }
+    */
+            paymentMetrics.failedIncomingRequests()
+
+        paymentMetrics.outgoingRequests()
+/*
+        dbScope.launch {
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
         }
+
+ */
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -147,12 +142,14 @@ class PaymentExternalSystemAdapterImpl(
             if (nowTime > deadline) {
                 logger.error("[$accountName] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
                 paymentMetrics.failedOutgoingRequests()
-
-                dbExecutor.submit {
+/*
+                dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
                     }
                 }
+
+ */
 
                 complete()
                 return
@@ -180,12 +177,14 @@ class PaymentExternalSystemAdapterImpl(
                             paymentMetrics.failedOutgoingRequests()
                             val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
                             logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                            dbExecutor.submit {
+/*
+                            dbScope.launch {
                                 paymentESService.update(paymentId) {
                                     it.logProcessing(false, now(), transactionId, reason = reason)
                                 }
                             }
+
+ */
 
                             complete()
                         }
@@ -212,12 +211,14 @@ class PaymentExternalSystemAdapterImpl(
                             "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
                                     "succeeded: ${bodyObj.result}, message: ${bodyObj.message}"
                         )
-
-                        dbExecutor.submit {
+/*
+                        dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(bodyObj.result, now(), transactionId, reason = bodyObj.message)
                             }
                         }
+
+ */
 
                         if (bodyObj.result) {
                             complete()

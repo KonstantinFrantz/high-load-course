@@ -37,8 +37,8 @@ class OrderPayer {
         64,
         64,
         5L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue<Runnable>(400_000),
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(800_000),
         NamedThreadFactory("pse"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -49,11 +49,11 @@ class OrderPayer {
     // в реализации — используй его. Если нет, нужно либо дождаться слота,
     // либо явно фейлить с логом, а не тихо терять запросы.
     // Здесь используем tick с явным логированием дропа.
-    var rateLimiter = LeakingBucketRateLimiter(2000, Duration.ofMillis(1000), 2000)
+    var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 100_000)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
-        logger.warn("${processPaymentExecutor.completedTaskCount}, ${processPaymentExecutor.activeCount}, ${processPaymentExecutor.queue.size}")
+        //logger.warn("${processPaymentExecutor.completedTaskCount}, ${processPaymentExecutor.activeCount}, ${processPaymentExecutor.queue.size}")
         val accepted = rateLimiter.tick {
             processPaymentExecutor.submit {
                 val createdEvent = paymentESService.create {

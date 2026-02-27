@@ -3,6 +3,10 @@ package ru.quipy.payments.config
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -10,12 +14,28 @@ import ru.quipy.config.PaymentMetrics
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.payments.logic.*
+import java.io.Closeable
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.*
+import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.CoroutineContext
 
+// CoroutineScope не имеет метода cancel() как обычного метода — это extension-функция,
+// поэтому Spring не может её найти через рефлексию для destroyMethod.
+// Оборачиваем в Closeable: Spring вызовет close() → cancel() при shutdown контекста.
+class CloseableCoroutineScope(context: CoroutineContext) : Closeable, CoroutineScope {
+    override val coroutineContext: CoroutineContext = context
+
+    override fun close() {
+        coroutineContext.cancel()
+    }
+}
 
 @Configuration
 class PaymentAccountsConfig {
@@ -36,8 +56,24 @@ class PaymentAccountsConfig {
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
 
+    @Bean(destroyMethod = "close")
+    fun dbCoroutineScope(): CloseableCoroutineScope {
+        val dispatcher = ThreadPoolExecutor(
+            1, 1,
+            60L, TimeUnit.SECONDS,
+            LinkedBlockingQueue(100_000),
+            Executors.defaultThreadFactory(),
+            ThreadPoolExecutor.CallerRunsPolicy()
+        ).asCoroutineDispatcher()
+        return CloseableCoroutineScope(dispatcher + SupervisorJob())
+    }
+
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>, paymentMetrics: PaymentMetrics): List<PaymentExternalSystemAdapter> {
+    fun accountAdapters(
+        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+        paymentMetrics: PaymentMetrics,
+        dbScope: CloseableCoroutineScope
+    ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
             .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
@@ -59,7 +95,8 @@ class PaymentAccountsConfig {
                     paymentService,
                     paymentProviderHostPort,
                     token,
-                    paymentMetrics
+                    paymentMetrics,
+                    dbScope
                 )
             }
     }
