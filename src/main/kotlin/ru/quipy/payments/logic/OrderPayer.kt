@@ -34,11 +34,11 @@ class OrderPayer {
     // CallerBlockingRejectedExecutionHandler гарантирует backpressure
     // вместо тихого дропа задач при переполнении очереди.
     private val processPaymentExecutor = ThreadPoolExecutor(
-        40,
-        40,
+        64,
+        64,
         5L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue<Runnable>(80_000),
+        LinkedBlockingQueue<Runnable>(400_000),
         NamedThreadFactory("pse"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -49,11 +49,11 @@ class OrderPayer {
     // в реализации — используй его. Если нет, нужно либо дождаться слота,
     // либо явно фейлить с логом, а не тихо терять запросы.
     // Здесь используем tick с явным логированием дропа.
-    var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 4500)
+    var rateLimiter = LeakingBucketRateLimiter(2000, Duration.ofMillis(1000), 2000)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
-
+        logger.warn("${processPaymentExecutor.completedTaskCount}, ${processPaymentExecutor.activeCount}, ${processPaymentExecutor.queue.size}")
         val accepted = rateLimiter.tick {
             processPaymentExecutor.submit {
                 val createdEvent = paymentESService.create {

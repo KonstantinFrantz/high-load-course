@@ -42,16 +42,16 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val rateLimiter = SlidingWindowRateLimiter(3000, Duration.ofMillis(500L))
+    private val ongoingWindow = OngoingWindow(2000)
 
     private val httpThreadPoolSize = maxOf(100, parallelRequests / 10)
     private val httpExecutor = ThreadPoolExecutor(
-        httpThreadPoolSize,
-        httpThreadPoolSize,
+        64,
+        64,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(parallelRequests * 2),
+        LinkedBlockingQueue(200_000),
         Executors.defaultThreadFactory(),
         CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
     )
@@ -66,11 +66,11 @@ class PaymentExternalSystemAdapterImpl(
     // берём x2 запас = 80. Очередь большая чтобы абсорбировать пики
     // и не доходить до CallerBlocking который заблокирует httpExecutor.
     private val dbExecutor = ThreadPoolExecutor(
-        32,
-        32,
+        16,
+        16,
         60L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(400_000), // очень большая очередь
+        LinkedBlockingQueue(100_000), // очень большая очередь
         Executors.defaultThreadFactory(),
         ThreadPoolExecutor.CallerRunsPolicy() // крайний случай — выполнит в вызывающем потоке, но не заблокирует
     )
@@ -84,9 +84,9 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        rateLimiter.tickBlocking()
+      //  rateLimiter.tickBlocking()
         ongoingWindow.acquire()
-
+        //logger.warn("${dbExecutor.activeCount}, ${dbExecutor.activeCount}, ${dbExecutor.completedTaskCount}, ${dbExecutor.queue.size}")
         val currentTime = now()
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded before submission. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
