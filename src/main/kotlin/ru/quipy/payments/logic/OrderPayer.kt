@@ -29,13 +29,9 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // Увеличиваем пул потоков: при 4000 rps очередь 80k задач начнёт
-    // накапливаться если потоков слишком мало. 40 потоков дадут запас.
-    // CallerBlockingRejectedExecutionHandler гарантирует backpressure
-    // вместо тихого дропа задач при переполнении очереди.
     private val processPaymentExecutor = ThreadPoolExecutor(
-        64,
-        64,
+        40,
+        40,
         5L,
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(800_000),
@@ -43,12 +39,6 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    // Лимит чуть ниже максимума (4500 из 5000) чтобы оставить буфер.
-    // ВАЖНО: LeakingBucketRateLimiter.tick() при переполнении возвращает false
-    // и молча дропает задачу — это неприемлемо. Если у тебя есть tickBlocking()
-    // в реализации — используй его. Если нет, нужно либо дождаться слота,
-    // либо явно фейлить с логом, а не тихо терять запросы.
-    // Здесь используем tick с явным логированием дропа.
     var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 100_000)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
@@ -70,8 +60,6 @@ class OrderPayer {
         }
 
         if (!accepted) {
-            // Явный лог вместо тихого дропа — так хотя бы видно в метриках/логах
-            // что мы теряем запросы и нужно поднять лимит или масштабировать сервис.
             logger.warn("[$orderId] Payment $paymentId DROPPED by rate limiter at $createdAt")
         }
 

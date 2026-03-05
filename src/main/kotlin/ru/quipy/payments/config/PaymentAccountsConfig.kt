@@ -26,9 +26,6 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
 
-// CoroutineScope не имеет метода cancel() как обычного метода — это extension-функция,
-// поэтому Spring не может её найти через рефлексию для destroyMethod.
-// Оборачиваем в Closeable: Spring вызовет close() → cancel() при shutdown контекста.
 class CloseableCoroutineScope(context: CoroutineContext) : Closeable, CoroutineScope {
     override val coroutineContext: CoroutineContext = context
 
@@ -59,7 +56,8 @@ class PaymentAccountsConfig {
     @Bean(destroyMethod = "close")
     fun dbCoroutineScope(): CloseableCoroutineScope {
         val dispatcher = ThreadPoolExecutor(
-            1, 1,
+            16,
+            16,
             60L, TimeUnit.SECONDS,
             LinkedBlockingQueue(100_000),
             Executors.defaultThreadFactory(),

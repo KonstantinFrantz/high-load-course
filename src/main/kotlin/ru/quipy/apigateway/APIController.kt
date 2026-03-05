@@ -70,7 +70,6 @@ class APIController {
         paymentMetrics.incomingRequests()
 
         val order = orderRepository.findById(orderId)?.let {
-            // перевели заказ в состояние "оплата идёт"
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
             it
         } ?: throw IllegalArgumentException("No such order $orderId")

@@ -49,8 +49,8 @@ class PaymentExternalSystemAdapterImpl(
     private val ongoingWindow = OngoingWindow(2000)
 
     private val httpExecutor = ThreadPoolExecutor(
-        64,
-        64,
+        40,
+        40,
         60L,
         TimeUnit.SECONDS,
         LinkedBlockingQueue(200_000),
@@ -77,7 +77,7 @@ class PaymentExternalSystemAdapterImpl(
         ongoingWindow.acquire()
         val currentTime = now()
 
-            /*
+
         if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded before submission. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
 
@@ -97,18 +97,18 @@ class PaymentExternalSystemAdapterImpl(
         ongoingWindow.release()
         return
     }
-    */
-            paymentMetrics.failedIncomingRequests()
+
+        paymentMetrics.failedIncomingRequests()
 
         paymentMetrics.outgoingRequests()
-/*
+
         dbScope.launch {
             paymentESService.update(paymentId) {
                 it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
         }
 
- */
+
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -142,14 +142,12 @@ class PaymentExternalSystemAdapterImpl(
             if (nowTime > deadline) {
                 logger.error("[$accountName] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
                 paymentMetrics.failedOutgoingRequests()
-/*
+
                 dbScope.launch {
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
                     }
                 }
-
- */
 
                 complete()
                 return
@@ -177,14 +175,12 @@ class PaymentExternalSystemAdapterImpl(
                             paymentMetrics.failedOutgoingRequests()
                             val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
                             logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-/*
+
                             dbScope.launch {
                                 paymentESService.update(paymentId) {
                                     it.logProcessing(false, now(), transactionId, reason = reason)
                                 }
                             }
-
- */
 
                             complete()
                         }
@@ -211,14 +207,13 @@ class PaymentExternalSystemAdapterImpl(
                             "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
                                     "succeeded: ${bodyObj.result}, message: ${bodyObj.message}"
                         )
-/*
+
                         dbScope.launch {
                             paymentESService.update(paymentId) {
                                 it.logProcessing(bodyObj.result, now(), transactionId, reason = bodyObj.message)
                             }
                         }
 
- */
 
                         if (bodyObj.result) {
                             complete()
