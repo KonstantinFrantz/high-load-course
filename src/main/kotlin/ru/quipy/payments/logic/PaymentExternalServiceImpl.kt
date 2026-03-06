@@ -23,6 +23,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.random.Random
 
 class PaymentExternalSystemAdapterImpl(
@@ -68,6 +69,11 @@ class PaymentExternalSystemAdapterImpl(
     private val baseBackoff = Duration.ofMillis(100)
     private val maxBackoff = Duration.ofSeconds(1)
 
+
+    private val hedgeDelayMs: Long = requestAverageProcessingTime.toMillis()
+        .coerceAtLeast(50L)
+        .coerceAtMost(500L)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -77,29 +83,26 @@ class PaymentExternalSystemAdapterImpl(
         ongoingWindow.acquire()
         val currentTime = now()
 
-
         if (currentTime > deadline) {
-            logger.error("[$accountName] Payment $paymentId deadline exceeded before submission. Started: $paymentStartedAt, deadline: $deadline, now: $currentTime")
-
-        dbScope.launch {
-            paymentESService.update(paymentId) {
-                it.logSubmission(
-                    success = false,
-                    transactionId,
-                    currentTime,
-                    Duration.ofMillis(currentTime - paymentStartedAt),
-                )
+            logger.error(
+                "[$accountName] Payment $paymentId deadline exceeded before submission. " +
+                        "Started: $paymentStartedAt, deadline: $deadline, now: $currentTime"
+            )
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(
+                        success = false,
+                        transactionId,
+                        currentTime,
+                        Duration.ofMillis(currentTime - paymentStartedAt),
+                    )
+                }
             }
+            ongoingWindow.release()
+            return
         }
 
-
-
-        ongoingWindow.release()
-        return
-    }
-
         paymentMetrics.failedIncomingRequests()
-
         paymentMetrics.outgoingRequests()
 
         dbScope.launch {
@@ -108,47 +111,64 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
+        logger.info("[$accountName] Submit: $paymentId, txId: $transactionId, hedgeDelayMs: $hedgeDelayMs")
 
+        val windowReleased = AtomicBoolean(false)
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        val successLogged = AtomicBoolean(false)
 
         fun complete() {
-            ongoingWindow.release()
+            if (windowReleased.compareAndSet(false, true)) {
+                ongoingWindow.release()
+            }
         }
 
-        fun buildRequest(): HttpRequest {
-            val uri = URI.create(
-                "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-            )
+        fun isAlreadyCompleted() = windowReleased.get()
 
+        fun buildRequest(): HttpRequest {
             val nowTime = now()
             val remainingMillis = (deadline - nowTime).coerceIn(200L, 30_000L)
+            val uri = URI.create(
+                "http://$paymentProviderHostPort/external/process" +
+                        "?serviceName=$serviceName" +
+                        "&token=$token" +
+                        "&accountName=$accountName" +
+                        "&transactionId=$transactionId" +
+                        "&paymentId=$paymentId" +
+                        "&amount=$amount"
+            )
             return HttpRequest.newBuilder()
                 .uri(uri)
                 .timeout(Duration.ofMillis(remainingMillis))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .header("deadline", deadline.toString())
                 .header("timeout", remainingMillis.toString())
+                .header("x-idempotency-key", transactionId.toString())
                 .build()
         }
 
-        fun scheduleRetry(nextAttempt: Int, action: () -> Unit) {
+        fun scheduleRetry(nextAttempt: Int, label: String, action: () -> Unit) {
             val delayMillis = calcBackoffMillis(nextAttempt)
+            logger.warn("[$accountName] [$label] Scheduling retry attempt $nextAttempt in ${delayMillis}ms for txId: $transactionId")
             CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS, httpExecutor).execute(action)
         }
 
-        fun attemptRequest(attempt: Int) {
-            val nowTime = now()
-            if (nowTime > deadline) {
-                logger.error("[$accountName] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
-                paymentMetrics.failedOutgoingRequests()
+        fun attemptRequest(attempt: Int, label: String) {
+            if (isAlreadyCompleted()) {
+                logger.debug("[$accountName] [$label] Skipping attempt $attempt — already completed. txId: $transactionId")
+                return
+            }
 
-                dbScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+            if (now() > deadline) {
+                logger.error("[$accountName] [$label] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
+                paymentMetrics.failedOutgoingRequests()
+                if (!successLogged.get()) {
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded.")
+                        }
                     }
                 }
-
                 complete()
                 return
             }
@@ -161,27 +181,35 @@ class PaymentExternalSystemAdapterImpl(
                     val latency = Duration.ofNanos(System.nanoTime() - start)
                     paymentMetrics.recordExternalLatency(latency)
 
+                    if (isAlreadyCompleted() && throwable != null) {
+                        logger.debug("[$accountName] [$label] Late error ignored (already completed). txId: $transactionId")
+                        return@whenComplete
+                    }
+
                     if (throwable != null) {
                         val e = unwrapException(throwable)
                         val retriable = isRetriableException(e)
                         if (retriable && attempt + 1 < maxRetries && now() <= deadline) {
                             paymentMetrics.incrementExternalRetry()
                             logger.warn(
-                                "[$accountName] Retriable exception for txId: $transactionId, payment: $paymentId, attempt: ${attempt + 1}",
+                                "[$accountName] [$label] Retriable exception on attempt $attempt for txId: $transactionId, payment: $paymentId",
                                 e
                             )
-                            scheduleRetry(attempt + 1) { attemptRequest(attempt + 1) }
+                            scheduleRetry(attempt + 1, label) { attemptRequest(attempt + 1, label) }
                         } else {
                             paymentMetrics.failedOutgoingRequests()
                             val reason = if (e is SocketTimeoutException) "Request timeout." else e.message
-                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                            dbScope.launch {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = reason)
+                            logger.error(
+                                "[$accountName] [$label] Payment failed for txId: $transactionId, payment: $paymentId",
+                                e
+                            )
+                            if (!successLogged.get()) {
+                                dbScope.launch {
+                                    paymentESService.update(paymentId) {
+                                        it.logProcessing(false, now(), transactionId, reason = reason)
+                                    }
                                 }
                             }
-
                             complete()
                         }
                     } else {
@@ -192,68 +220,86 @@ class PaymentExternalSystemAdapterImpl(
                             mapper.readValue(response.body(), ExternalSysResponse::class.java)
                         } catch (e: Exception) {
                             logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                        "result code: $status, reason: ${response.body()}",
+                                "[$accountName] [$label] Failed to parse response for txId: $transactionId, payment: $paymentId, " +
+                                        "status: $status, body: ${response.body()}",
                                 e
                             )
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                         }
 
-                        if (!bodyObj.result) {
-                            paymentMetrics.failedOutgoingRequests()
-                        }
-
                         logger.warn(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                            "[$accountName] [$label] Payment processed for txId: $transactionId, payment: $paymentId, " +
                                     "succeeded: ${bodyObj.result}, message: ${bodyObj.message}"
                         )
 
-                        dbScope.launch {
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(bodyObj.result, now(), transactionId, reason = bodyObj.message)
-                            }
-                        }
-
-
                         if (bodyObj.result) {
+                            if (successLogged.compareAndSet(false, true)) {
+                                dbScope.launch {
+                                    paymentESService.update(paymentId) {
+                                        it.logProcessing(true, now(), transactionId, reason = bodyObj.message)
+                                    }
+                                }
+                            } else {
+                                logger.debug(
+                                    "[$accountName] [$label] Duplicate success response discarded " +
+                                            "(idempotent). txId: $transactionId"
+                                )
+                            }
                             complete()
-                        } else if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
-                            paymentMetrics.incrementExternalRetry()
-                            logger.warn(
-                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, " +
-                                        "retry attempt: ${attempt + 1}"
-                            )
-                            scheduleRetry(attempt + 1) { attemptRequest(attempt + 1) }
                         } else {
-                            complete()
+                            paymentMetrics.failedOutgoingRequests()
+                            if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
+                                paymentMetrics.incrementExternalRetry()
+                                logger.warn(
+                                    "[$accountName] [$label] Payment failed, retry attempt ${attempt + 1} " +
+                                            "for txId: $transactionId, payment: $paymentId"
+                                )
+                                scheduleRetry(attempt + 1, label) { attemptRequest(attempt + 1, label) }
+                            } else {
+                                if (!successLogged.get()) {
+                                    dbScope.launch {
+                                        paymentESService.update(paymentId) {
+                                            it.logProcessing(false, now(), transactionId, reason = bodyObj.message)
+                                        }
+                                    }
+                                }
+                                complete()
+                            }
                         }
                     }
                 }
         }
 
-        attemptRequest(0)
+        attemptRequest(0, "primary")
+
+        CompletableFuture.delayedExecutor(hedgeDelayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
+            if (!isAlreadyCompleted() && now() <= deadline) {
+                logger.info(
+                    "[$accountName] Primary request exceeded hedgeDelayMs (${hedgeDelayMs}ms), " +
+                            "firing hedged request for payment $paymentId, txId: $transactionId"
+                )
+                paymentMetrics.outgoingRequests()
+                attemptRequest(0, "hedge")
+            }
+        }
     }
 
     override fun price() = properties.price
     override fun isEnabled() = properties.enabled
     override fun name() = properties.accountName
 
-    private fun shouldRetry(status: Int): Boolean {
-        return status == 408 || status == 429 || status in 500..599
-    }
+    private fun shouldRetry(status: Int): Boolean =
+        status == 408 || status == 429 || status in 500..599
 
-    private fun isRetriableException(e: Exception): Boolean {
-        return e is SocketTimeoutException
+    private fun isRetriableException(e: Exception): Boolean =
+        e is SocketTimeoutException
                 || e is java.net.ConnectException
                 || e is java.net.SocketException
                 || e is java.io.InterruptedIOException
-    }
 
     private fun unwrapException(throwable: Throwable): Exception {
-        val cause = if (throwable is java.util.concurrent.CompletionException && throwable.cause != null) {
-            throwable.cause!!
-        } else throwable
-
+        val cause = if (throwable is java.util.concurrent.CompletionException && throwable.cause != null)
+            throwable.cause!! else throwable
         return if (cause is Exception) cause else Exception(cause)
     }
 
