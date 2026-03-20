@@ -22,6 +22,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -64,6 +65,59 @@ class PaymentExternalSystemAdapterImpl(
             .build()
     )
 
+    private data class PendingPayment(
+        val paymentId: UUID,
+        val amount: Int,
+        val paymentStartedAt: Long,
+        val deadline: Long
+    )
+
+    private val retryBuffer = ConcurrentLinkedQueue<PendingPayment>()
+
+    private val drainExecutor = ThreadPoolExecutor(
+        8, 8,
+        60L, TimeUnit.SECONDS,
+        LinkedBlockingQueue(100_000)
+    )
+
+    private val drainerThread = Thread({
+        while (!Thread.currentThread().isInterrupted) {
+            try {
+                drainBuffer()
+                Thread.sleep(50)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+    }, "something").apply {
+        isDaemon = true
+        start()
+    }
+
+    private fun drainBuffer() {
+        if (retryBuffer.isEmpty()) return
+        if (circuitBreaker.state == CircuitBreaker.State.OPEN) return
+
+        var drained = 0
+        while (true) {
+            val pending = retryBuffer.poll() ?: break
+
+            if (circuitBreaker.state == CircuitBreaker.State.OPEN) {
+                retryBuffer.offer(pending)
+                break
+            }
+
+            drainExecutor.submit {
+                performPaymentAsync(pending.paymentId, pending.amount, pending.paymentStartedAt, pending.deadline)
+            }
+            drained++
+        }
+
+        if (drained > 0) {
+            logger.info("[$accountName] Buffer: dispatched $drained payments, ${retryBuffer.size} remaining")
+        }
+    }
+
     private val httpExecutor = ThreadPoolExecutor(
         40,
         40,
@@ -92,12 +146,8 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
 
         if (!circuitBreaker.tryAcquirePermission()) {
-            logger.warn("[$accountName] CB ${circuitBreaker.state} — rejecting $paymentId")
-            dbScope.launch {
-                paymentESService.update(paymentId) {
-                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                }
-            }
+            logger.warn("[$accountName] CB ${circuitBreaker.state} — buffering $paymentId (buffer size: ${retryBuffer.size})")
+            retryBuffer.offer(PendingPayment(paymentId, amount, paymentStartedAt, deadline))
             return
         }
 
