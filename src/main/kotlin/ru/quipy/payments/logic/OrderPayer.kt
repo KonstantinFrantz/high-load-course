@@ -39,7 +39,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 100_000)
+    var rateLimiter = LeakingBucketRateLimiter(100, Duration.ofMillis(1000), 100_000)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()

@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
@@ -46,8 +48,19 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(4000, Duration.ofMillis(1000L))
-    private val ongoingWindow = OngoingWindow(2000)
+    private val rateLimiter = SlidingWindowRateLimiter(100, Duration.ofMillis(1000L))
+    private val ongoingWindow = OngoingWindow(20000)
+
+    private val circuitBreaker = CircuitBreaker.of(
+        "payment-$accountName",
+        CircuitBreakerConfig.custom()
+            .failureRateThreshold(10F)
+            .slowCallRateThreshold(10F)
+            .waitDurationInOpenState(Duration.ofSeconds(10))
+            .slowCallDurationThreshold(Duration.ofSeconds(1))
+            .permittedNumberOfCallsInHalfOpenState(50)
+            .build()
+    )
 
     private val httpExecutor = ThreadPoolExecutor(
         40,
@@ -61,14 +74,13 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(1000L))
+        .connectTimeout(Duration.ofMillis(10000000L))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
     private val maxRetries = 3
     private val baseBackoff = Duration.ofMillis(100)
     private val maxBackoff = Duration.ofSeconds(1)
-
 
     private val hedgeDelayMs: Long = requestAverageProcessingTime.toMillis()
         .coerceAtLeast(50L)
@@ -79,6 +91,16 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            logger.warn("[$accountName] CB ${circuitBreaker.state} — rejecting $paymentId")
+            dbScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
+            }
+            return
+        }
+
         rateLimiter.tickBlocking()
         ongoingWindow.acquire()
         val currentTime = now()
@@ -88,6 +110,7 @@ class PaymentExternalSystemAdapterImpl(
                 "[$accountName] Payment $paymentId deadline exceeded before submission. " +
                         "Started: $paymentStartedAt, deadline: $deadline, now: $currentTime"
             )
+            circuitBreaker.releasePermission()
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logSubmission(
@@ -114,7 +137,6 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId, txId: $transactionId, hedgeDelayMs: $hedgeDelayMs")
 
         val windowReleased = AtomicBoolean(false)
-
         val successLogged = AtomicBoolean(false)
 
         fun complete() {
@@ -127,7 +149,7 @@ class PaymentExternalSystemAdapterImpl(
 
         fun buildRequest(): HttpRequest {
             val nowTime = now()
-            val remainingMillis = (deadline - nowTime).coerceIn(200L, 30_000L)
+            val remainingMillis = 10000000L
             val uri = URI.create(
                 "http://$paymentProviderHostPort/external/process" +
                         "?serviceName=$serviceName" +
@@ -179,6 +201,7 @@ class PaymentExternalSystemAdapterImpl(
             client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
                 .whenComplete { response, throwable ->
                     val latency = Duration.ofNanos(System.nanoTime() - start)
+                    val latencyMs = latency.toMillis()
                     paymentMetrics.recordExternalLatency(latency)
 
                     if (isAlreadyCompleted() && throwable != null) {
@@ -188,6 +211,8 @@ class PaymentExternalSystemAdapterImpl(
 
                     if (throwable != null) {
                         val e = unwrapException(throwable)
+                        circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, e)
+
                         val retriable = isRetriableException(e)
                         if (retriable && attempt + 1 < maxRetries && now() <= deadline) {
                             paymentMetrics.incrementExternalRetry()
@@ -233,6 +258,8 @@ class PaymentExternalSystemAdapterImpl(
                         )
 
                         if (bodyObj.result) {
+                            circuitBreaker.onSuccess(latencyMs, TimeUnit.MILLISECONDS)
+
                             if (successLogged.compareAndSet(false, true)) {
                                 dbScope.launch {
                                     paymentESService.update(paymentId) {
@@ -248,6 +275,12 @@ class PaymentExternalSystemAdapterImpl(
                             complete()
                         } else {
                             paymentMetrics.failedOutgoingRequests()
+
+                            circuitBreaker.onError(
+                                latencyMs, TimeUnit.MILLISECONDS,
+                                RuntimeException("HTTP $status: ${bodyObj.message}")
+                            )
+
                             if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
                                 paymentMetrics.incrementExternalRetry()
                                 logger.warn(
