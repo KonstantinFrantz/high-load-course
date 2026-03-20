@@ -53,7 +53,7 @@ class PaymentExternalSystemAdapterImpl(
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val circuitBreaker = CircuitBreaker.of(
-        "payment-$accountName",
+        "something",
         CircuitBreakerConfig.custom()
             .slidingWindowType(SlidingWindowType.TIME_BASED)
             .slidingWindowSize(2)
