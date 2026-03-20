@@ -50,34 +50,22 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    // FIX 1: Rate limiter — не превышаем серверный лимит.
-    // Если серверный ratePerSecond=100, а у нас rateLimitPerSec=200,
-    // лучше быть чуть ниже серверного лимита, чтобы не получать 429.
-    // Но если мы не знаем серверный лимит, хотя бы используем свой.
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000L))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    // FIX 2: Circuit Breaker — более разумные пороги
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-$accountName",
         CircuitBreakerConfig.custom()
-            // Порог ошибок — 50% вместо 10%. Реальные сбои сервиса, а не rate limiting.
             .failureRateThreshold(50.0f)
-            // Slow calls — 80% вместо 10%. Не триггерим CB из-за пары медленных запросов.
-            .slowCallRateThreshold(80.0f)
-            // Slow call порог — осмысленное значение относительно таймаута
-            .slowCallDurationThreshold(Duration.ofSeconds(2))
-            // Время в OPEN — 10 секунд, ок
+            // Отключаем slow call как триггер CB — при длинных дедлайнах
+            // "медленный" ответ — это нормальный ответ
+            .slowCallRateThreshold(100.0f)
+            .slowCallDurationThreshold(Duration.ofSeconds(30))
             .waitDurationInOpenState(Duration.ofSeconds(10))
-            // HALF_OPEN: пускаем мало запросов для проверки, а не 50
             .permittedNumberOfCallsInHalfOpenState(5)
-            // TIME_BASED окно — смотрим на последние N секунд, а не N вызовов
             .slidingWindowType(SlidingWindowType.TIME_BASED)
-            .slidingWindowSize(30) // 30 секунд
-            // Минимум вызовов перед оценкой — не открываем CB на малой выборке
-            .minimumNumberOfCalls(20)
-            // FIX 3: 429 НЕ считаем failure для CB — это rate limiting, а не сбой сервиса
-            .recordException { e -> !isRateLimitException(e) }
+            .slidingWindowSize(30)
+            .minimumNumberOfCalls(10)
             .build()
     )
 
@@ -100,18 +88,18 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client: HttpClient = HttpClient.newBuilder()
         .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(1000L))
+        .connectTimeout(Duration.ofMillis(1500L))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
     private val maxRetries = 3
-    private val baseBackoff = Duration.ofMillis(100)
+    private val baseBackoff = Duration.ofMillis(200)
     private val maxBackoff = Duration.ofSeconds(2)
 
     private val hedgeDelayMs: Long = requestAverageProcessingTime.toMillis()
-        .times(2)
-        .coerceAtLeast(200L)
-        .coerceAtMost(1000L)
+        .times(3)
+        .coerceAtLeast(300L)
+        .coerceAtMost(2000L)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -131,8 +119,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         // Step 2: Deadline check
-        val currentTime = now()
-        if (currentTime > deadline) {
+        if (now() > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded before submission.")
             dbScope.launch {
                 paymentESService.update(paymentId) {
@@ -159,8 +146,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         // Step 5: Deadline check after rate limiter wait
-        val afterWait = now()
-        if (afterWait > deadline) {
+        if (now() > deadline) {
             circuitBreaker.releasePermission()
             logger.error("[$accountName] Payment $paymentId deadline exceeded after rate limiter wait.")
             dbScope.launch {
@@ -182,7 +168,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId, txId: $transactionId, hedgeDelayMs: $hedgeDelayMs")
+        logger.info("[$accountName] Submit: $paymentId, txId: $transactionId")
 
         val windowReleased = AtomicBoolean(false)
         val successLogged = AtomicBoolean(false)
@@ -195,13 +181,18 @@ class PaymentExternalSystemAdapterImpl(
 
         fun isAlreadyCompleted() = windowReleased.get()
 
-        // FIX 4: Более разумный таймаут запроса
+        // =============================================================
+        // ГЛАВНЫЙ FIX: таймаут = min(deadline - now, 10s)
+        //
+        // БЫЛО:   avg(100ms) * 4 = 400 → coerce(500,3000) → 500ms
+        //         Сервер под нагрузкой >500ms → таймаут → CB error
+        //
+        // СТАЛО:  deadline - now, capped 10s
+        //         Даём серверу реальное время ответить
+        // =============================================================
         fun buildRequest(): HttpRequest {
             val nowTime = now()
-            val maxRequestTimeout = requestAverageProcessingTime.toMillis()
-                .times(10)
-                .coerceIn(1_000L, 5_000L)
-            val remainingMillis = (deadline - nowTime).coerceIn(200L, maxRequestTimeout)
+            val remainingMillis = (deadline - nowTime).coerceIn(200L, 10_000L)
             val uri = URI.create(
                 "http://$paymentProviderHostPort/external/process" +
                         "?serviceName=$serviceName" +
@@ -334,12 +325,11 @@ class PaymentExternalSystemAdapterImpl(
                         } else {
                             paymentMetrics.failedOutgoingRequests()
 
-                            // FIX 5: 429 — не ошибка сервиса, а rate limiting.
-                            // Не кормим CB ошибками от 429, иначе CB открывается
-                            // из-за того что мы сами шлём слишком быстро.
+                            // 429 — нейтрален для CB: releasePermission
+                            // Не success (иначе CB решит что всё ок и пустит всё),
+                            // не error (иначе CB откроется). Просто не считаем.
                             if (status == 429) {
-                                // Rate limited — CB не трогаем, просто ретраим с backoff
-                                circuitBreaker.onSuccess(latencyMs, TimeUnit.MILLISECONDS)
+                                circuitBreaker.releasePermission()
                             } else if (shouldRetry(status)) {
                                 circuitBreaker.onError(
                                     latencyMs, TimeUnit.MILLISECONDS,
@@ -351,14 +341,13 @@ class PaymentExternalSystemAdapterImpl(
 
                             if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
                                 paymentMetrics.incrementExternalRetry()
-                                // FIX 6: Для 429 используем больший backoff
-                                val retryDelay = if (status == 429) {
-                                    calcBackoffMillis429(attempt + 1)
+                                val delayMs = if (status == 429) {
+                                    calcBackoff429(attempt + 1)
                                 } else {
                                     calcBackoffMillis(attempt + 1)
                                 }
-                                logger.warn("[$accountName] [$label] HTTP $status, retry ${attempt + 1} in ${retryDelay}ms. txId: $transactionId")
-                                CompletableFuture.delayedExecutor(retryDelay, TimeUnit.MILLISECONDS, httpExecutor).execute {
+                                logger.warn("[$accountName] [$label] HTTP $status, retry ${attempt + 1} in ${delayMs}ms. txId: $transactionId")
+                                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
                                     attemptRequest(attempt + 1, label)
                                 }
                             } else {
@@ -379,6 +368,7 @@ class PaymentExternalSystemAdapterImpl(
 
         attemptRequest(0, "primary")
 
+        // Hedge request
         CompletableFuture.delayedExecutor(hedgeDelayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
             val cbState = circuitBreaker.state
             if (!isAlreadyCompleted()
@@ -414,10 +404,6 @@ class PaymentExternalSystemAdapterImpl(
                 || e is java.net.SocketException
                 || e is java.io.InterruptedIOException
 
-    // Маркер-исключение для 429, чтобы CB его игнорировал через recordException
-    private fun isRateLimitException(e: Throwable): Boolean =
-        e is RateLimitException
-
     private fun unwrapException(throwable: Throwable): Exception {
         val cause = if (throwable is java.util.concurrent.CompletionException && throwable.cause != null)
             throwable.cause!! else throwable
@@ -430,15 +416,12 @@ class PaymentExternalSystemAdapterImpl(
         return Random.nextLong(0, capped.toMillis().coerceAtLeast(1))
     }
 
-    // FIX 7: Отдельный backoff для 429 — ждём дольше, даём серверу продохнуть
-    private fun calcBackoffMillis429(attempt: Int): Long {
+    private fun calcBackoff429(attempt: Int): Long {
         val base = Duration.ofMillis(500)
         val exp = base.multipliedBy(1L shl (attempt - 1).coerceAtLeast(0))
         val capped = if (exp > Duration.ofSeconds(3)) Duration.ofSeconds(3) else exp
         return Random.nextLong(capped.toMillis() / 2, capped.toMillis().coerceAtLeast(1))
     }
-
-    class RateLimitException(message: String?) : RuntimeException(message)
 }
 
 fun now() = System.currentTimeMillis()
