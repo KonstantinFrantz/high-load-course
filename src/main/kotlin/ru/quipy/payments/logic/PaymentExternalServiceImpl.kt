@@ -46,7 +46,6 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -55,13 +54,16 @@ class PaymentExternalSystemAdapterImpl(
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-$accountName",
-CircuitBreakerConfig.custom()
-        .failureRateThreshold(10F)
-        .slowCallRateThreshold(10F)
-        .waitDurationInOpenState(Duration.ofSeconds(10))
-        .slowCallDurationThreshold(Duration.ofSeconds(1))
-        .permittedNumberOfCallsInHalfOpenState(50)
-        .build()
+        CircuitBreakerConfig.custom()
+            .failureRateThreshold(50.0f)
+            .slowCallRateThreshold(100.0f)
+            .slowCallDurationThreshold(Duration.ofSeconds(30))
+            .waitDurationInOpenState(Duration.ofSeconds(10))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .slidingWindowType(SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(30)
+            .minimumNumberOfCalls(10)
+            .build()
     )
 
     init {
@@ -90,11 +92,6 @@ CircuitBreakerConfig.custom()
     private val maxRetries = 3
     private val baseBackoff = Duration.ofMillis(200)
     private val maxBackoff = Duration.ofSeconds(2)
-
-    private val hedgeDelayMs: Long = requestAverageProcessingTime.toMillis()
-        .times(3)
-        .coerceAtLeast(300L)
-        .coerceAtMost(2000L)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
@@ -176,15 +173,6 @@ CircuitBreakerConfig.custom()
 
         fun isAlreadyCompleted() = windowReleased.get()
 
-        // =============================================================
-        // ГЛАВНЫЙ FIX: таймаут = min(deadline - now, 10s)
-        //
-        // БЫЛО:   avg(100ms) * 4 = 400 → coerce(500,3000) → 500ms
-        //         Сервер под нагрузкой >500ms → таймаут → CB error
-        //
-        // СТАЛО:  deadline - now, capped 10s
-        //         Даём серверу реальное время ответить
-        // =============================================================
         fun buildRequest(): HttpRequest {
             val nowTime = now()
             val remainingMillis = (deadline - nowTime).coerceIn(200L, 10_000L)
@@ -207,20 +195,11 @@ CircuitBreakerConfig.custom()
                 .build()
         }
 
-        fun scheduleRetry(nextAttempt: Int, label: String, action: () -> Unit) {
-            val delayMillis = calcBackoffMillis(nextAttempt)
-            logger.warn("[$accountName] [$label] Retry $nextAttempt in ${delayMillis}ms, txId: $transactionId")
-            CompletableFuture.delayedExecutor(delayMillis, TimeUnit.MILLISECONDS, httpExecutor).execute(action)
-        }
-
-        fun attemptRequest(attempt: Int, label: String) {
-            if (isAlreadyCompleted()) {
-                logger.debug("[$accountName] [$label] Skipping attempt $attempt — already completed. txId: $transactionId")
-                return
-            }
+        fun attemptRequest(attempt: Int) {
+            if (isAlreadyCompleted()) return
 
             if (now() > deadline) {
-                logger.error("[$accountName] [$label] Deadline exceeded before attempt $attempt. txId: $transactionId")
+                logger.error("[$accountName] Deadline exceeded before attempt $attempt. txId: $transactionId")
                 paymentMetrics.failedOutgoingRequests()
                 if (!successLogged.get()) {
                     dbScope.launch {
@@ -231,11 +210,6 @@ CircuitBreakerConfig.custom()
                     }
                 }
                 complete()
-                return
-            }
-
-            if (label == "hedge" && !circuitBreaker.tryAcquirePermission()) {
-                logger.debug("[$accountName] Hedge CB-blocked, skipping. txId: $transactionId")
                 return
             }
 
@@ -250,14 +224,7 @@ CircuitBreakerConfig.custom()
                     paymentMetrics.recordExternalLatency(latency)
 
                     if (isAlreadyCompleted()) {
-                        if (throwable != null) {
-                            if (successLogged.get()) circuitBreaker.releasePermission()
-                            else circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, unwrapException(throwable))
-                        } else {
-                            if (successLogged.get()) circuitBreaker.releasePermission()
-                            else circuitBreaker.onSuccess(latencyMs, TimeUnit.MILLISECONDS)
-                        }
-                        logger.debug("[$accountName] [$label] Late result handled. txId: $transactionId")
+                        circuitBreaker.releasePermission()
                         return@whenComplete
                     }
 
@@ -267,13 +234,16 @@ CircuitBreakerConfig.custom()
 
                         if (isRetriableException(e) && attempt + 1 < maxRetries && now() <= deadline) {
                             paymentMetrics.incrementExternalRetry()
-                            logger.warn("[$accountName] [$label] Retriable error attempt $attempt. txId: $transactionId", e)
-                            scheduleRetry(attempt + 1, label) { attemptRequest(attempt + 1, label) }
+                            logger.warn("[$accountName] Retriable error attempt $attempt. txId: $transactionId", e)
+                            val delayMs = calcBackoffMillis(attempt + 1)
+                            CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
+                                attemptRequest(attempt + 1)
+                            }
                         } else {
                             paymentMetrics.failedOutgoingRequests()
                             val reason = if (e is HttpTimeoutException || e is SocketTimeoutException)
                                 "Request timeout." else e.message
-                            logger.error("[$accountName] [$label] Payment failed. txId: $transactionId", e)
+                            logger.error("[$accountName] Payment failed. txId: $transactionId", e)
                             if (!successLogged.get()) {
                                 dbScope.launch {
                                     submissionJob.join()
@@ -292,14 +262,14 @@ CircuitBreakerConfig.custom()
                             mapper.readValue(response.body(), ExternalSysResponse::class.java)
                         } catch (e: Exception) {
                             logger.error(
-                                "[$accountName] [$label] Failed to parse response. txId: $transactionId, " +
+                                "[$accountName] Failed to parse response. txId: $transactionId, " +
                                         "status: $status, body: ${response.body()}", e
                             )
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                         }
 
                         logger.warn(
-                            "[$accountName] [$label] Processed. txId: $transactionId, " +
+                            "[$accountName] Processed. txId: $transactionId, " +
                                     "succeeded: ${bodyObj.result}, message: ${bodyObj.message}"
                         )
 
@@ -313,16 +283,12 @@ CircuitBreakerConfig.custom()
                                         it.logProcessing(true, now(), transactionId, reason = bodyObj.message)
                                     }
                                 }
-                            } else {
-                                logger.debug("[$accountName] [$label] Duplicate success discarded. txId: $transactionId")
                             }
                             complete()
                         } else {
                             paymentMetrics.failedOutgoingRequests()
 
-                            // 429 — нейтрален для CB: releasePermission
-                            // Не success (иначе CB решит что всё ок и пустит всё),
-                            // не error (иначе CB откроется). Просто не считаем.
+                            // 429 нейтрален для CB
                             if (status == 429) {
                                 circuitBreaker.releasePermission()
                             } else if (shouldRetry(status)) {
@@ -341,9 +307,9 @@ CircuitBreakerConfig.custom()
                                 } else {
                                     calcBackoffMillis(attempt + 1)
                                 }
-                                logger.warn("[$accountName] [$label] HTTP $status, retry ${attempt + 1} in ${delayMs}ms. txId: $transactionId")
+                                logger.warn("[$accountName] HTTP $status, retry ${attempt + 1} in ${delayMs}ms. txId: $transactionId")
                                 CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
-                                    attemptRequest(attempt + 1, label)
+                                    attemptRequest(attempt + 1)
                                 }
                             } else {
                                 if (!successLogged.get()) {
@@ -361,30 +327,7 @@ CircuitBreakerConfig.custom()
                 }
         }
 
-        attemptRequest(0, "primary")
-
-        // Hedge request
-        CompletableFuture.delayedExecutor(hedgeDelayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
-            val cbState = circuitBreaker.state
-            if (!isAlreadyCompleted()
-                && now() <= deadline
-                && cbState != CircuitBreaker.State.HALF_OPEN
-                && cbState != CircuitBreaker.State.OPEN
-                && rateLimiter.tick()
-            ) {
-                logger.info(
-                    "[$accountName] Primary exceeded hedgeDelayMs (${hedgeDelayMs}ms), " +
-                            "firing hedge for $paymentId, txId: $transactionId"
-                )
-                paymentMetrics.outgoingRequests()
-                attemptRequest(0, "hedge")
-            } else {
-                logger.debug(
-                    "[$accountName] Hedge suppressed — cbState=$cbState, " +
-                            "completed=${isAlreadyCompleted()}. txId: $transactionId"
-                )
-            }
-        }
+        attemptRequest(0)
     }
 
     override fun price() = properties.price
