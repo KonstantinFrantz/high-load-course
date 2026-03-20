@@ -1,23 +1,23 @@
 package ru.quipy.payments.logic
 
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
-import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.config.PaymentMetrics
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 @Service
-class OrderPayer {
+class OrderPayer(val dbScope: CoroutineScope) {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
@@ -29,40 +29,49 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val processPaymentExecutor = ThreadPoolExecutor(
-        40,
-        40,
-        5L,
-        TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(800_000),
+    // Executor for coroutine dispatcher — coroutines suspend (not block) on DB join,
+    // so threads are freed while waiting. Queue is intentionally small to apply
+    // back-pressure instead of accumulating expired-deadline payments.
+    private val paymentExecutor = ThreadPoolExecutor(
+        30, 30,
+        60L, TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(500),
         NamedThreadFactory("pse"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.CallerRunsPolicy()
     )
 
-    var rateLimiter = LeakingBucketRateLimiter(4500, Duration.ofMillis(1000), 100_000)
+    // Coroutine scope on top of paymentExecutor — suspend points (join) yield the
+    // thread back to the pool instead of blocking it like runBlocking would.
+    private val scope = CoroutineScope(SupervisorJob() + paymentExecutor.asCoroutineDispatcher())
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        //logger.warn("${processPaymentExecutor.completedTaskCount}, ${processPaymentExecutor.activeCount}, ${processPaymentExecutor.queue.size}")
-        val accepted = rateLimiter.tick {
-            processPaymentExecutor.submit {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
-                }
-                logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
 
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        if (createdAt > deadline) {
+            logger.warn("[$orderId] Payment $paymentId already past deadline at creation, dropping")
+            return createdAt
+        }
+
+        scope.launch {
+            // Recheck deadline — coroutine may have waited in the executor queue
+            val now = System.currentTimeMillis()
+            if (now > deadline) {
+                logger.warn("[$orderId] Payment $paymentId expired while waiting in executor queue, dropping")
+                return@launch
             }
+
+            // Suspend (not block) until aggregate is written — required before
+            // submitPaymentRequest calls logSubmission (update), which needs the aggregate.
+            dbScope.launch {
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
+                }
+            }.join()  // suspend point: yields thread back to pool while waiting
+
+            logger.trace("Payment $paymentId for order $orderId created.")
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
 
-        if (!accepted) {
-            logger.warn("[$orderId] Payment $paymentId DROPPED by rate limiter at $createdAt")
-        }
-
-        return createdAt.takeIf { accepted }
+        return createdAt
     }
 }

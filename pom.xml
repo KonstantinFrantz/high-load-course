@@ -15,7 +15,7 @@
     <name>OnlineShop</name>
     <description>Application for resilience and highly-loaded applications course</description>
 
-	<properties>
+    <properties>
         <kotlin.version>2.2.0</kotlin.version>
         <kotlinx-coroutines-core.version>1.9.0</kotlinx-coroutines-core.version>
         <okhttp.version>4.12.0</okhttp.version>
@@ -25,7 +25,7 @@
         <caffeine.version>3.1.8</caffeine.version>
     </properties>
 
-	<dependencies>
+    <dependencies>
         <dependency>
             <groupId>io.github.resilience4j</groupId>
             <artifactId>resilience4j-ratelimiter</artifactId>
@@ -67,15 +67,15 @@
             <version>${jetty.version}</version>
         </dependency>
 
-<!--        <dependency>-->
-<!--            <groupId>org.eclipse.jetty</groupId>-->
-<!--            <artifactId>jetty-alpn-server</artifactId>-->
-<!--        </dependency>-->
+        <!--        <dependency>-->
+        <!--            <groupId>org.eclipse.jetty</groupId>-->
+        <!--            <artifactId>jetty-alpn-server</artifactId>-->
+        <!--        </dependency>-->
 
-<!--        <dependency>-->
-<!--            <groupId>org.eclipse.jetty</groupId>-->
-<!--            <artifactId>jetty-alpn-conscrypt-server</artifactId>-->
-<!--        </dependency>-->
+        <!--        <dependency>-->
+        <!--            <groupId>org.eclipse.jetty</groupId>-->
+        <!--            <artifactId>jetty-alpn-conscrypt-server</artifactId>-->
+        <!--        </dependency>-->
 
         <dependency>
             <groupId>com.fasterxml.jackson.module</groupId>
@@ -92,6 +92,12 @@
             <groupId>com.github.ben-manes.caffeine</groupId>
             <artifactId>caffeine</artifactId>
             <version>${caffeine.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-circuitbreaker</artifactId>
+            <version>${resilience4jVersion}</version>
         </dependency>
 
         <dependency>
