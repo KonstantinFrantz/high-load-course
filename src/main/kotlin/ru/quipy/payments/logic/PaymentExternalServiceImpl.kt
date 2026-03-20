@@ -46,6 +46,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
+    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -58,8 +59,11 @@ class PaymentExternalSystemAdapterImpl(
             .failureRateThreshold(50.0f)
             .slowCallRateThreshold(100.0f)
             .slowCallDurationThreshold(Duration.ofSeconds(30))
-            .waitDurationInOpenState(Duration.ofSeconds(10))
-            .permittedNumberOfCallsInHalfOpenState(5)
+            // Закрыли на 2 секунды, потом автоматически переходим в HALF_OPEN
+            .waitDurationInOpenState(Duration.ofSeconds(2))
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            // В HALF_OPEN пускаем 3 запроса — если хотя бы часть ок, переходим в CLOSED
+            .permittedNumberOfCallsInHalfOpenState(3)
             .slidingWindowType(SlidingWindowType.TIME_BASED)
             .slidingWindowSize(30)
             .minimumNumberOfCalls(10)
@@ -98,7 +102,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        // Step 1: CB OPEN — fast-fail
+        // Step 1
         if (circuitBreaker.state == CircuitBreaker.State.OPEN) {
             logger.warn("[$accountName] CB OPEN — fast-failing $paymentId before rate limiter")
             paymentMetrics.failedOutgoingRequests()
@@ -110,8 +114,9 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // Step 2: Deadline check
-        if (now() > deadline) {
+        // Step 2
+        val currentTime = now()
+        if (currentTime > deadline) {
             logger.error("[$accountName] Payment $paymentId deadline exceeded before submission.")
             dbScope.launch {
                 paymentESService.update(paymentId) {
@@ -121,10 +126,10 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // Step 3: Rate limiter
+        // Step 3
         rateLimiter.tickBlocking()
 
-        // Step 4: CB permission
+        // Step 4
         if (!circuitBreaker.tryAcquirePermission()) {
             val cbState = circuitBreaker.state
             logger.warn("[$accountName] CB $cbState — fast-failing $paymentId after rate limiter")
@@ -137,8 +142,9 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // Step 5: Deadline check after rate limiter wait
-        if (now() > deadline) {
+        // Step 5
+        val afterWait = now()
+        if (afterWait > deadline) {
             circuitBreaker.releasePermission()
             logger.error("[$accountName] Payment $paymentId deadline exceeded after rate limiter wait.")
             dbScope.launch {
@@ -149,7 +155,7 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        // Step 6: Ongoing window
+        // Step 6
         ongoingWindow.acquire()
 
         paymentMetrics.outgoingRequests()
@@ -195,8 +201,16 @@ class PaymentExternalSystemAdapterImpl(
                 .build()
         }
 
+        fun scheduleRetry(nextAttempt: Int, delayMs: Long, action: () -> Unit) {
+            logger.warn("[$accountName] Retry $nextAttempt in ${delayMs}ms, txId: $transactionId")
+            CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute(action)
+        }
+
         fun attemptRequest(attempt: Int) {
-            if (isAlreadyCompleted()) return
+            if (isAlreadyCompleted()) {
+                logger.debug("[$accountName] Skipping attempt $attempt — already completed. txId: $transactionId")
+                return
+            }
 
             if (now() > deadline) {
                 logger.error("[$accountName] Deadline exceeded before attempt $attempt. txId: $transactionId")
@@ -225,6 +239,7 @@ class PaymentExternalSystemAdapterImpl(
 
                     if (isAlreadyCompleted()) {
                         circuitBreaker.releasePermission()
+                        logger.debug("[$accountName] Late result ignored. txId: $transactionId")
                         return@whenComplete
                     }
 
@@ -235,8 +250,7 @@ class PaymentExternalSystemAdapterImpl(
                         if (isRetriableException(e) && attempt + 1 < maxRetries && now() <= deadline) {
                             paymentMetrics.incrementExternalRetry()
                             logger.warn("[$accountName] Retriable error attempt $attempt. txId: $transactionId", e)
-                            val delayMs = calcBackoffMillis(attempt + 1)
-                            CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
+                            scheduleRetry(attempt + 1, calcBackoffMillis(attempt + 1)) {
                                 attemptRequest(attempt + 1)
                             }
                         } else {
@@ -283,12 +297,13 @@ class PaymentExternalSystemAdapterImpl(
                                         it.logProcessing(true, now(), transactionId, reason = bodyObj.message)
                                     }
                                 }
+                            } else {
+                                logger.debug("[$accountName] Duplicate success discarded. txId: $transactionId")
                             }
                             complete()
                         } else {
                             paymentMetrics.failedOutgoingRequests()
 
-                            // 429 нейтрален для CB
                             if (status == 429) {
                                 circuitBreaker.releasePermission()
                             } else if (shouldRetry(status)) {
@@ -302,15 +317,10 @@ class PaymentExternalSystemAdapterImpl(
 
                             if (shouldRetry(status) && attempt + 1 < maxRetries && now() <= deadline) {
                                 paymentMetrics.incrementExternalRetry()
-                                val delayMs = if (status == 429) {
-                                    calcBackoff429(attempt + 1)
-                                } else {
-                                    calcBackoffMillis(attempt + 1)
-                                }
-                                logger.warn("[$accountName] HTTP $status, retry ${attempt + 1} in ${delayMs}ms. txId: $transactionId")
-                                CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
-                                    attemptRequest(attempt + 1)
-                                }
+                                val delayMs = if (status == 429) calcBackoff429(attempt + 1)
+                                else calcBackoffMillis(attempt + 1)
+                                logger.warn("[$accountName] HTTP $status, retry ${attempt + 1}. txId: $transactionId")
+                                scheduleRetry(attempt + 1, delayMs) { attemptRequest(attempt + 1) }
                             } else {
                                 if (!successLogged.get()) {
                                     dbScope.launch {
