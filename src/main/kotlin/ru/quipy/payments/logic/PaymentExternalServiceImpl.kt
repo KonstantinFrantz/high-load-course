@@ -56,11 +56,11 @@ class PaymentExternalSystemAdapterImpl(
         "something",
         CircuitBreakerConfig.custom()
             .slidingWindowType(SlidingWindowType.TIME_BASED)
-            .slidingWindowSize(2)
-            .failureRateThreshold(20.0f)
+            .slidingWindowSize(5)
+            .failureRateThreshold(40.0f)
             .minimumNumberOfCalls(10)
-            .waitDurationInOpenState(Duration.ofSeconds(1))
-            .permittedNumberOfCallsInHalfOpenState(5)
+            .waitDurationInOpenState(Duration.ofSeconds(2))
+            .permittedNumberOfCallsInHalfOpenState(10)
             .build()
     )
 
