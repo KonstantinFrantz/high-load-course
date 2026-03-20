@@ -181,6 +181,19 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
+            if (attempt > 0 && !circuitBreaker.tryAcquirePermission()) {
+                logger.warn("[$accountName] [$label] CB ${circuitBreaker.state} — skipping retry $attempt. txId: $transactionId")
+                if (!successLogged.get()) {
+                    dbScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Circuit breaker is open")
+                        }
+                    }
+                }
+                complete()
+                return
+            }
+
             if (now() > deadline) {
                 logger.error("[$accountName] [$label] Deadline exceeded before attempt $attempt for txId: $transactionId, payment: $paymentId")
                 paymentMetrics.failedOutgoingRequests()
@@ -306,7 +319,7 @@ class PaymentExternalSystemAdapterImpl(
         attemptRequest(0, "primary")
 
         CompletableFuture.delayedExecutor(hedgeDelayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
-            if (!isAlreadyCompleted() && now() <= deadline) {
+            if (!isAlreadyCompleted() && now() <= deadline && circuitBreaker.tryAcquirePermission()) {
                 logger.info(
                     "[$accountName] Primary request exceeded hedgeDelayMs (${hedgeDelayMs}ms), " +
                             "firing hedged request for payment $paymentId, txId: $transactionId"
