@@ -89,7 +89,7 @@ class PaymentExternalSystemAdapterImpl(
                 Thread.currentThread().interrupt()
             }
         }
-    }, "something").apply {
+    }, "something2").apply {
         isDaemon = true
         start()
     }
