@@ -55,18 +55,13 @@ class PaymentExternalSystemAdapterImpl(
 
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-$accountName",
-        CircuitBreakerConfig.custom()
-            .failureRateThreshold(50.0f)
-            // Отключаем slow call как триггер CB — при длинных дедлайнах
-            // "медленный" ответ — это нормальный ответ
-            .slowCallRateThreshold(100.0f)
-            .slowCallDurationThreshold(Duration.ofSeconds(30))
-            .waitDurationInOpenState(Duration.ofSeconds(10))
-            .permittedNumberOfCallsInHalfOpenState(5)
-            .slidingWindowType(SlidingWindowType.TIME_BASED)
-            .slidingWindowSize(30)
-            .minimumNumberOfCalls(10)
-            .build()
+CircuitBreakerConfig.custom()
+        .failureRateThreshold(10F)
+        .slowCallRateThreshold(10F)
+        .waitDurationInOpenState(Duration.ofSeconds(10))
+        .slowCallDurationThreshold(Duration.ofSeconds(1))
+        .permittedNumberOfCallsInHalfOpenState(50)
+        .build()
     )
 
     init {
