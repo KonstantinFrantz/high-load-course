@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.github.resilience4j.circuitbreaker.CircuitBreaker
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
@@ -48,17 +49,18 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rateLimiter = SlidingWindowRateLimiter(100, Duration.ofMillis(1000L))
-    private val ongoingWindow = OngoingWindow(20000)
+    private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000L))
+    private val ongoingWindow = OngoingWindow(parallelRequests)
 
     private val circuitBreaker = CircuitBreaker.of(
         "payment-$accountName",
         CircuitBreakerConfig.custom()
-            .failureRateThreshold(10F)
-            .slowCallRateThreshold(10F)
-            .waitDurationInOpenState(Duration.ofSeconds(10))
-            .slowCallDurationThreshold(Duration.ofSeconds(1))
-            .permittedNumberOfCallsInHalfOpenState(50)
+            .slidingWindowType(SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(2)
+            .failureRateThreshold(20.0f)
+            .minimumNumberOfCalls(10)
+            .waitDurationInOpenState(Duration.ofSeconds(1))
+            .permittedNumberOfCallsInHalfOpenState(5)
             .build()
     )
 
@@ -67,14 +69,12 @@ class PaymentExternalSystemAdapterImpl(
         40,
         60L,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(200_000),
+        LinkedBlockingQueue(1000),
         Executors.defaultThreadFactory(),
-        CallerBlockingRejectedExecutionHandler(Duration.ofSeconds(5))
     )
 
     private val client: HttpClient = HttpClient.newBuilder()
-        .executor(httpExecutor)
-        .connectTimeout(Duration.ofMillis(10000000L))
+        .connectTimeout(Duration.ofSeconds(2))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
@@ -110,7 +110,7 @@ class PaymentExternalSystemAdapterImpl(
                 "[$accountName] Payment $paymentId deadline exceeded before submission. " +
                         "Started: $paymentStartedAt, deadline: $deadline, now: $currentTime"
             )
-            circuitBreaker.releasePermission()
+            circuitBreaker.onError(0, TimeUnit.MILLISECONDS, RuntimeException("Rate limited"))
             dbScope.launch {
                 paymentESService.update(paymentId) {
                     it.logSubmission(
@@ -149,7 +149,7 @@ class PaymentExternalSystemAdapterImpl(
 
         fun buildRequest(): HttpRequest {
             val nowTime = now()
-            val remainingMillis = 10000000L
+            val remainingMillis = 400L
             val uri = URI.create(
                 "http://$paymentProviderHostPort/external/process" +
                         "?serviceName=$serviceName" +
