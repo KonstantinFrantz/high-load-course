@@ -53,30 +53,16 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofMillis(1000L))
     private val ongoingWindow = OngoingWindow(parallelRequests)
 
-    // ── Circuit Breaker ────────────────────────────────────────────────────────
-    // TIME_BASED 10 s window → at 100 rps ≈ 1000 calls, fresh data every second.
-    // Trip on ≥50% failures OR ≥50% slow calls (slow = 3× avg, min 300 ms).
-    // waitDuration = 15 s: give the external service real time to recover.
-    // HALF_OPEN: only 3 probes; if any fails → back to OPEN immediately.
-    // ──────────────────────────────────────────────────────────────────────────
-    private val slowCallThreshold: Duration = requestAverageProcessingTime
-        .multipliedBy(1)
-        .coerceAtLeast(Duration.ofMillis(300))
-
     private val circuitBreaker: CircuitBreaker = CircuitBreaker.of(
         "payment-$accountName",
         CircuitBreakerConfig.custom()
-            .slidingWindowType(SlidingWindowType.TIME_BASED)
-            .slidingWindowSize(5)            // 10 секунд, ~1000 вызовов при 100 rps
-            .failureRateThreshold(50.0f)      // триггер по ошибкам
-            .slowCallRateThreshold(50.0f)     // триггер по медленным
-            .slowCallDurationThreshold(slowCallThreshold) // 3× avg = 300ms
-            .minimumNumberOfCalls(1)         // минимум для решения
-            .waitDurationInOpenState(Duration.ofSeconds(2)) // пауза для восстановления
-            .permittedNumberOfCallsInHalfOpenState(3)
+            .failureRateThreshold(10.0f)
+            .slowCallRateThreshold(10.0f)
+            .slowCallDurationThreshold(Duration.ofSeconds(1))
+            .waitDurationInOpenState(Duration.ofSeconds(10))
+            .permittedNumberOfCallsInHalfOpenState(50)
             .build()
     )
-
 
     init {
         circuitBreaker.eventPublisher.onStateTransition { event ->
@@ -87,8 +73,6 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    // Threads = parallelRequests in flight = rps × maxTimeout.
-    // 200 rps × 3 s cap = 600 max concurrent, +headroom = 120 threads.
     private val httpExecutor = ThreadPoolExecutor(
         120, 120,
         60L, TimeUnit.SECONDS,
@@ -107,9 +91,6 @@ class PaymentExternalSystemAdapterImpl(
     private val baseBackoff = Duration.ofMillis(100)
     private val maxBackoff = Duration.ofSeconds(1)
 
-    // Hedge fires only when primary takes > 2× average — roughly the P85-P90 mark.
-    // Using 1× average (old value) hedged ~50% of all requests, doubling outgoing rps.
-    // Using 2× average ensures we only hedge genuinely slow outliers.
     private val hedgeDelayMs: Long = requestAverageProcessingTime.toMillis()
         .times(2)
         .coerceAtLeast(200L)
@@ -119,16 +100,6 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-
-        // ── Fast-fail order (each step is cheaper / non-blocking) ─────────────
-        // 1. CB state — non-consuming read. Prevents threads queuing in
-        //    tickBlocking() while CB is OPEN (root cause of thundering herd).
-        // 2. Deadline pre-check.
-        // 3. tickBlocking() — only for payments that will actually be sent.
-        // 4. tryAcquirePermission() — CB slot; state may have changed while waiting.
-        // 5. Deadline recheck — time passed during tickBlocking wait.
-        // 6. ongoingWindow.acquire().
-        // ─────────────────────────────────────────────────────────────────────
 
         // Step 1
         if (circuitBreaker.state == CircuitBreaker.State.OPEN) {
@@ -209,8 +180,6 @@ class PaymentExternalSystemAdapterImpl(
 
         fun buildRequest(): HttpRequest {
             val nowTime = now()
-            // Cap timeout at 4× average (min 500 ms, max 3 s).
-            // A 30-s timeout fills CB window with in-flight calls; CB never sees failures.
             val maxRequestTimeout = requestAverageProcessingTime.toMillis()
                 .times(4)
                 .coerceIn(500L, 3_000L)
@@ -261,7 +230,6 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            // Hedge needs its own CB permission
             if (label == "hedge" && !circuitBreaker.tryAcquirePermission()) {
                 logger.debug("[$accountName] Hedge CB-blocked, skipping. txId: $transactionId")
                 return
@@ -278,7 +246,6 @@ class PaymentExternalSystemAdapterImpl(
                     paymentMetrics.recordExternalLatency(latency)
 
                     if (isAlreadyCompleted()) {
-                        // Late result from the losing leg — release CB cleanly
                         if (throwable != null) {
                             if (successLogged.get()) circuitBreaker.releasePermission()
                             else circuitBreaker.onError(latencyMs, TimeUnit.MILLISECONDS, unwrapException(throwable))
@@ -355,7 +322,6 @@ class PaymentExternalSystemAdapterImpl(
                                     RuntimeException("HTTP $status: ${bodyObj.message}")
                                 )
                             } else {
-                                // Business rejection — not a circuit-breaker failure
                                 circuitBreaker.onSuccess(latencyMs, TimeUnit.MILLISECONDS)
                             }
 
@@ -381,8 +347,6 @@ class PaymentExternalSystemAdapterImpl(
 
         attemptRequest(0, "primary")
 
-        // Hedge fires only after 2× average processing time — genuine outliers only.
-        // Skip when CB is OPEN or HALF_OPEN to avoid wasting probe permits.
         CompletableFuture.delayedExecutor(hedgeDelayMs, TimeUnit.MILLISECONDS, httpExecutor).execute {
             val cbState = circuitBreaker.state
             if (!isAlreadyCompleted()
